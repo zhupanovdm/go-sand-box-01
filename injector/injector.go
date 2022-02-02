@@ -1,73 +1,95 @@
 package injector
 
 import (
-	"errors"
 	"fmt"
 	"reflect"
 )
 
-type DependencyList []*DependencyInfo
+type (
+	UnitDescriptor struct {
+		name       string
+		factory    Factory
+		objectType reflect.Type
+		self       interface{}
+	}
 
-type DependencyInfo struct {
-	name         string
-	fqn          string
-	args         []reflect.Type
-	factory      reflect.Value
-	returns      reflect.Type
-	returnsError bool
-	object       interface{}
-}
+	UnitDescriptorList []*UnitDescriptor
+)
 
 type Injector struct {
-	reg       DependencyList
-	nameIndex map[string]*DependencyInfo
-	retIndex  map[reflect.Type]DependencyList
+	registry    UnitDescriptorList
+	indexByName map[string]*UnitDescriptor
+	indexByType map[reflect.Type]UnitDescriptorList
+	argsByType  map[reflect.Type]reflect.Value
 }
 
 func (r *Injector) SetArgs(args ...interface{}) {
-
+	for _, arg := range args {
+		v := reflect.ValueOf(arg)
+		r.argsByType[v.Type()] = v
+	}
 }
 
 func (r *Injector) AddFactory(constructor interface{}, name string) error {
-	t := reflect.TypeOf(constructor)
+	v := reflect.ValueOf(constructor)
 
-	d := &DependencyInfo{name: name}
-
-	switch t.Kind() {
+	switch v.Type().Kind() {
 	case reflect.Func:
-		if t.NumOut() > 2 {
-			return errors.New("factory must return 1 or 2 values")
+		f := Factory(v)
+		if err := f.Validate(); err != nil {
+			return fmt.Errorf("factory is not valid: %w", err)
 		}
 
-		rt := t.Out(0)
-		if rt.Kind() != reflect.Interface {
-			return fmt.Errorf("first returned value must be interface, got: %v", t)
+		d, err := r.register(name, f.returnsType())
+		if err != nil {
+			return fmt.Errorf("failed to register factory: %w", err)
 		}
-		d.returns = rt
-		d.fqn = rt.String()
-		d.returnsError = t.NumOut() > 1
+		d.factory = f
 
-		d.args = make([]reflect.Type, 0, t.NumIn())
-		for i := 0; i < t.NumIn(); i++ {
-			d.args = append(d.args, t.In(i))
-		}
-
-		r.reg = append(r.reg, d)
+		r.registry = append(r.registry, d)
 	case reflect.Ptr:
-		return r.AddFactory(reflect.ValueOf(constructor).Elem().Interface(), name)
+		return r.AddFactory(v.Elem().Interface(), name)
 	default:
-		return fmt.Errorf("incorrect factory type: %v", t)
+		return fmt.Errorf("incorrect factory type: %v", v.Type())
 	}
 	return nil
 }
 
-func (r *Injector) Get(name string) interface{} {
+func (r *Injector) GetByName(name string) (interface{}, error) {
+	u, exists := r.indexByName[name]
+	if !exists {
+		return nil, fmt.Errorf("not found by name: %s", name)
+	}
+	if u.self != nil {
+		return u.self, nil
+	}
 
+	return nil, nil
+}
+
+func (r *Injector) args() []reflect.Value {
 	return nil
+}
+
+func (r *Injector) register(name string, typ reflect.Type) (*UnitDescriptor, error) {
+	if _, exists := r.indexByName[name]; exists {
+		return nil, fmt.Errorf("allready registered: %s", name)
+	}
+	if _, exists := r.indexByType[typ]; !exists {
+		r.indexByType[typ] = make(UnitDescriptorList, 0, 1)
+	}
+
+	u := &UnitDescriptor{name: name, objectType: typ}
+	r.indexByName[name] = u
+	r.indexByType[typ] = append(r.indexByType[typ], u)
+	return u, nil
 }
 
 func New() Injector {
 	return Injector{
-		reg: make(DependencyList, 0),
+		registry:    make(UnitDescriptorList, 0),
+		indexByName: make(map[string]*UnitDescriptor),
+		indexByType: make(map[reflect.Type]UnitDescriptorList),
+		argsByType:  make(map[reflect.Type]reflect.Value),
 	}
 }

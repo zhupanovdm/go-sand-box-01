@@ -30,5 +30,5 @@ func main() {
 	if err := i.AddFactory(NewObject1, "object1"); err != nil {
 		log.Fatal(err)
 	}
-	i.Get("dep")
+	i.GetByName("dep")
 }

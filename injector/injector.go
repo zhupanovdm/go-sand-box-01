@@ -3,6 +3,14 @@ package injector
 import (
 	"fmt"
 	"reflect"
+	"strings"
+)
+
+const (
+	InjectTagKey = "inject"
+
+	DefaultFlag = "default"
+	RequireFlag = "require"
 )
 
 type (
@@ -14,14 +22,13 @@ type (
 	}
 
 	UnitDescriptorList []*UnitDescriptor
-)
 
-type Injector struct {
-	registry    UnitDescriptorList
-	indexByName map[string]*UnitDescriptor
-	indexByType map[reflect.Type]UnitDescriptorList
-	argsByType  map[reflect.Type]reflect.Value
-}
+	Injector struct {
+		registry    UnitDescriptorList
+		indexByType map[reflect.Type]UnitDescriptorList
+		argsByType  map[reflect.Type]reflect.Value
+	}
+)
 
 func (r *Injector) SetArgs(args ...interface{}) {
 	for _, arg := range args {
@@ -37,12 +44,12 @@ func (r *Injector) AddFactory(constructor interface{}, name string) error {
 	case reflect.Func:
 		f := Factory(v)
 		if err := f.Validate(); err != nil {
-			return fmt.Errorf("factory is not valid: %w", err)
+			return fmt.Errorf("injector: factory is not valid: %w", err)
 		}
 
-		d, err := r.register(name, f.returnsType())
+		d, err := r.register(name, f.ReturnsType())
 		if err != nil {
-			return fmt.Errorf("failed to register factory: %w", err)
+			return fmt.Errorf("injector: failed to register factory: %w", err)
 		}
 		d.factory = f
 
@@ -50,21 +57,87 @@ func (r *Injector) AddFactory(constructor interface{}, name string) error {
 	case reflect.Ptr:
 		return r.AddFactory(v.Elem().Interface(), name)
 	default:
-		return fmt.Errorf("incorrect factory type: %v", v.Type())
+		return fmt.Errorf("injector: incorrect factory type: %v", v.Type())
 	}
 	return nil
 }
 
-func (r *Injector) GetByName(name string) (interface{}, error) {
-	u, exists := r.indexByName[name]
-	if !exists {
-		return nil, fmt.Errorf("not found by name: %s", name)
+func (r *Injector) ObjectByTypeName(t reflect.Type, name string) (interface{}, error) {
+	if u := r.indexByType[t].FindFirstByName(name); u != nil {
+		return r.object(u)
 	}
+	return nil, nil
+}
+
+func (r *Injector) ObjectByType(t reflect.Type) (interface{}, error) {
+	if list, exists := r.indexByType[t]; exists {
+		if len(list) > 1 {
+			return nil, fmt.Errorf("injector: ambigous request by type %v: %d items found", t, len(list))
+		}
+		return r.object(list[0])
+	}
+	return nil, nil
+}
+
+func (r *Injector) object(u *UnitDescriptor) (interface{}, error) {
 	if u.self != nil {
 		return u.self, nil
 	}
+	object, err := u.factory.Spawn(func(argType reflect.Type) (reflect.Value, bool) {
+		arg, ok := r.argsByType[argType]
+		return arg, ok
+	})
+	if err != nil {
+		return nil, err
+	}
+	if object != nil {
+		v := reflect.ValueOf(object).Elem()
+		t := v.Type()
+		for i := 0; i < t.NumField(); i++ {
+			name := DefaultFlag
+			tagFlags := make(map[string]bool)
 
-	return nil, nil
+			field := t.Field(i)
+			if tagValue, ok := field.Tag.Lookup(InjectTagKey); ok {
+				tagValues := strings.Split(tagValue, ",")
+				for j, tag := range tagValues {
+					switch tag {
+					case DefaultFlag:
+						if j == 0 {
+							name = DefaultFlag
+							tagFlags[DefaultFlag] = true
+						}
+					case RequireFlag:
+						tagFlags[RequireFlag] = true
+					default:
+						name = tag
+					}
+				}
+			}
+
+			var dep interface{}
+			if tagFlags[DefaultFlag] {
+				if dep, err = r.ObjectByType(field.Type); err != nil {
+					return nil, fmt.Errorf("injector: error while constructing dependency %v: %w", field.Type, err)
+				}
+			} else {
+				if dep, err = r.ObjectByTypeName(field.Type, name); err != nil {
+					return nil, fmt.Errorf("injector: error while constructing dependency %v&%s: %w", field.Type, name, err)
+				}
+			}
+			if dep == nil && tagFlags[RequireFlag] {
+				return nil, fmt.Errorf("injector: missed required dependency %v&%s", field.Type, name)
+			}
+			if dep != nil {
+				if !v.Field(i).CanAddr() {
+					return nil, fmt.Errorf("injector: cannot set field value: %s", field.Name)
+				}
+				v.Field(i).Set(reflect.ValueOf(dep).Elem().Addr())
+			}
+		}
+		u.self = object
+	}
+	return object, nil
 }
 
 func (r *Injector) args() []reflect.Value {
@@ -72,23 +145,29 @@ func (r *Injector) args() []reflect.Value {
 }
 
 func (r *Injector) register(name string, typ reflect.Type) (*UnitDescriptor, error) {
-	if _, exists := r.indexByName[name]; exists {
-		return nil, fmt.Errorf("allready registered: %s", name)
+	if r.indexByType[typ].FindFirstByName(name) != nil {
+		return nil, fmt.Errorf("injector: allready registered by name: %s", name)
 	}
 	if _, exists := r.indexByType[typ]; !exists {
 		r.indexByType[typ] = make(UnitDescriptorList, 0, 1)
 	}
-
 	u := &UnitDescriptor{name: name, objectType: typ}
-	r.indexByName[name] = u
 	r.indexByType[typ] = append(r.indexByType[typ], u)
 	return u, nil
+}
+
+func (l UnitDescriptorList) FindFirstByName(name string) *UnitDescriptor {
+	for _, u := range l {
+		if u.name == name {
+			return u
+		}
+	}
+	return nil
 }
 
 func New() Injector {
 	return Injector{
 		registry:    make(UnitDescriptorList, 0),
-		indexByName: make(map[string]*UnitDescriptor),
 		indexByType: make(map[reflect.Type]UnitDescriptorList),
 		argsByType:  make(map[reflect.Type]reflect.Value),
 	}

@@ -1,11 +1,15 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"reflect"
 	"sandBox01/injector"
 )
 
-type Config struct{}
+type Config struct {
+	attr string
+}
 
 var _ ObjectIFace = (*Object1)(nil)
 var _ ObjectIFace = (*Object2)(nil)
@@ -14,21 +18,32 @@ type ObjectIFace interface {
 }
 
 type Object1 struct {
-	dep2 ObjectIFace
+	Dep2 ObjectIFace `inject:"object2,require"`
+	attr string
 }
 
 type Object2 struct {
 }
 
-func NewObject1(cfg *Config) ObjectIFace {
-	return Object1{}
+func NewObject1(cfg *Config) (ObjectIFace, error) {
+	return &Object1{attr: cfg.attr}, nil
+}
+
+func NewObject2() (ObjectIFace, error) {
+	return &Object2{}, nil
 }
 
 func main() {
 	i := injector.New()
-	i.SetArgs(&Config{})
+	i.SetArgs(&Config{"fddgg"})
 	if err := i.AddFactory(NewObject1, "object1"); err != nil {
 		log.Fatal(err)
 	}
-	i.GetByName("dep")
+	if err := i.AddFactory(NewObject2, "object2"); err != nil {
+		log.Fatal(err)
+	}
+
+	var t = reflect.TypeOf((*ObjectIFace)(nil)).Elem()
+	o1, err := i.ObjectByTypeName(t, "object1")
+	fmt.Println(o1, err)
 }

@@ -5,6 +5,7 @@ import (
 	"log"
 	"reflect"
 	"sandBox01/injector"
+	"sandBox01/injector/strategy"
 )
 
 type Config struct {
@@ -36,10 +37,10 @@ func NewObject2() (ObjectIFace, error) {
 func main() {
 	i := injector.New()
 	i.SetArgs(&Config{"fddgg"})
-	if err := i.AddFactory(NewObject1, "object1"); err != nil {
+	if err := i.AddFactory(strategy.SingletonType, NewObject1, "object1"); err != nil {
 		log.Fatal(err)
 	}
-	if err := i.AddFactory(NewObject2, "object2"); err != nil {
+	if err := i.AddFactory(strategy.SingletonType, NewObject2, "object2"); err != nil {
 		log.Fatal(err)
 	}
 

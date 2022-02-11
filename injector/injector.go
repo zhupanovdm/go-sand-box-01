@@ -4,88 +4,106 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-
-	"sandBox01/injector/spawner"
-	"sandBox01/injector/strategy"
+	"sync"
 )
 
 const (
 	InjectTagKey = "inject"
 
-	DefaultFlag = "default"
-	RequireFlag = "require"
+	DefaultTagFlag = "default"
+	RequireTagFlag = "require"
 )
 
+var _ Injector = (*registry)(nil)
+
 type (
-	Unit struct {
-		Provider
+	registry struct {
+		sync.RWMutex
+		unitByName map[string]*unit
+		unitByType map[reflect.Type]unitList
+
+		configsByType map[reflect.Type]*reflect.Value
+	}
+
+	unit struct {
+		sync.Mutex
+		ObjectProvider
 		name string
 	}
 
-	UnitList []*Unit
-
-	Injector struct {
-		indexByType map[reflect.Type]UnitList
-		argsByType  map[reflect.Type]reflect.Value
-	}
+	unitList []*unit
 )
 
-func (r *Injector) SetArgs(args ...interface{}) {
-	for _, arg := range args {
-		v := reflect.ValueOf(arg)
-		r.argsByType[v.Type()] = v
+func (u *unit) String() string {
+	if u == nil {
+		return "<nil>"
+	}
+	return u.name
+}
+
+func (l unitList) String() string {
+	var b strings.Builder
+	for i, u := range l {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(u.String())
+	}
+	return b.String()
+}
+
+func (r *registry) AddConfig(configs ...interface{}) {
+	for _, cfg := range configs {
+		value := reflect.ValueOf(cfg)
+		r.configsByType[value.Type()] = &value
 	}
 }
 
-func (r *Injector) AddFactory(strategy strategy.Strategy, constructor interface{}, name string) error {
+func (r *registry) RegisterFactory(name string, factoryFunc interface{}, strategy Strategy) error {
 	if err := strategy.Validate(); err != nil {
 		return fmt.Errorf("injector: unknown injecting strategy %v", strategy)
 	}
-
-	v := reflect.ValueOf(constructor)
-	switch v.Type().Kind() {
-	case reflect.Func:
-		spwnr := spawner.Spawner(v)
-		if err := spwnr.Validate(); err != nil {
-			return fmt.Errorf("injector: factory is not valid: %w", err)
-		}
-
-		prvdr := strategy.ApplyTo(spwnr)
-		d, err := r.register(name, prvdr)
-		if err != nil {
-			return fmt.Errorf("injector: failed to register factory: %w", err)
-		}
-		d.Provider = prvdr
-
-	case reflect.Ptr:
-		return r.AddFactory(strategy, v.Elem().Interface(), name)
-
-	default:
-		return fmt.Errorf("injector: incorrect factory type: %v", v.Type())
-
+	spawner, err := SpawnerFromFactoryFunc(factoryFunc)
+	if err != nil {
+		return fmt.Errorf("injector: can't convert function to spawner: %w", err)
+	}
+	if err := r.register(name, strategy.ApplyTo(spawner)); err != nil {
+		return fmt.Errorf("injector: failed to register factory: %w", err)
 	}
 	return nil
 }
 
-func (r *Injector) ObjectByTypeName(t reflect.Type, name string) (interface{}, error) {
-	if u := r.indexByType[t].FindFirstByName(name); u != nil {
-		return r.object(u)
+func (r *registry) ObjectByTypeName(t reflect.Type, name string) (interface{}, error) {
+	if u := r.unitByType[t].FindFirstByName(name); u != nil {
+		return r.object(u, make(unitList, 0))
 	}
 	return nil, nil
 }
 
-func (r *Injector) ObjectByType(t reflect.Type) (interface{}, error) {
-	if list, exists := r.indexByType[t]; exists {
+func (r *registry) ObjectByType(t reflect.Type) (interface{}, error) {
+	if list, exists := r.unitByType[t]; exists {
 		if len(list) > 1 {
-			return nil, fmt.Errorf("injector: ambigous request by type %v: %d items found", t, len(list))
+			return nil, fmt.Errorf("registry: ambigous request by type %v: %d items found", t, len(list))
 		}
-		return r.object(list[0])
+		return r.object(list[0], make(unitList, 0))
 	}
 	return nil, nil
 }
 
-func (r *Injector) object(u *Unit) (interface{}, error) {
-	object, err := u.Create(func(argType reflect.Type) (arg reflect.Value, ok bool) { arg, ok = r.argsByType[argType]; return })
+func (r *registry) config(typ reflect.Type) *reflect.Value {
+	return r.configsByType[typ]
+}
+
+func (r *registry) object(u *unit, cyclicCheck unitList) (interface{}, error) {
+	for i, dependent := range cyclicCheck {
+		if u == dependent {
+			path := cyclicCheck[:i+1]
+			return nil, fmt.Errorf("injector: cyclic dependency detected: %v", path)
+		}
+	}
+	cyclicCheck = append(cyclicCheck, u)
+
+	object, err := u.Get(r.config)
 	if err != nil {
 		return nil, err
 	}
@@ -93,11 +111,10 @@ func (r *Injector) object(u *Unit) (interface{}, error) {
 		return nil, nil
 	}
 
-	v := reflect.ValueOf(*object)
-	e := v.Elem()
+	e := object.Elem()
 	t := e.Type()
 	for i := 0; i < t.NumField(); i++ {
-		name := DefaultFlag
+		name := DefaultTagFlag
 		tagFlags := make(map[string]bool)
 
 		field := t.Field(i)
@@ -105,13 +122,13 @@ func (r *Injector) object(u *Unit) (interface{}, error) {
 			tagValues := strings.Split(tagValue, ",")
 			for j, tag := range tagValues {
 				switch tag {
-				case DefaultFlag:
+				case DefaultTagFlag:
 					if j == 0 {
-						name = DefaultFlag
-						tagFlags[DefaultFlag] = true
+						name = DefaultTagFlag
+						tagFlags[DefaultTagFlag] = true
 					}
-				case RequireFlag:
-					tagFlags[RequireFlag] = true
+				case RequireTagFlag:
+					tagFlags[RequireTagFlag] = true
 				default:
 					name = tag
 				}
@@ -119,46 +136,52 @@ func (r *Injector) object(u *Unit) (interface{}, error) {
 		}
 
 		var dep interface{}
-		if tagFlags[DefaultFlag] {
+		if tagFlags[DefaultTagFlag] {
 			if dep, err = r.ObjectByType(field.Type); err != nil {
-				return nil, fmt.Errorf("injector: error while constructing dependency %v: %w", field.Type, err)
+				return nil, fmt.Errorf("registry: error while constructing dependency %v: %w", field.Type, err)
 			}
 		} else {
 			if dep, err = r.ObjectByTypeName(field.Type, name); err != nil {
-				return nil, fmt.Errorf("injector: error while constructing dependency %v&%s: %w", field.Type, name, err)
+				return nil, fmt.Errorf("registry: error while constructing dependency %v&%s: %w", field.Type, name, err)
 			}
 		}
-		if dep == nil && tagFlags[RequireFlag] {
-			return nil, fmt.Errorf("injector: missed required dependency %v&%s", field.Type, name)
+		if dep == nil && tagFlags[RequireTagFlag] {
+			return nil, fmt.Errorf("registry: missed required dependency %v&%s", field.Type, name)
 		}
 		if dep != nil {
-			if !v.Field(i).CanAddr() {
-				return nil, fmt.Errorf("injector: cannot set field value: %s", field.Name)
+			if !object.Field(i).CanAddr() {
+				return nil, fmt.Errorf("registry: cannot set field value: %s", field.Name)
 			}
-			v.Field(i).Set(reflect.ValueOf(dep).Elem().Addr())
+			object.Field(i).Set(reflect.ValueOf(dep).Elem().Addr())
 		}
 	}
-	return v.Interface(), nil
+	return object.Interface(), nil
 }
 
-func (r *Injector) args() []reflect.Value {
+func (r *registry) byName(name string) *unit {
+	r.RLock()
+	defer r.RUnlock()
+	return r.unitByName[name]
+}
+
+func (r *registry) register(name string, provider ObjectProvider) error {
+	r.Lock()
+	defer r.Unlock()
+
+	t := provider.Type()
+	if _, exists := r.unitByName[name]; exists {
+		return fmt.Errorf("injector: already registered by name: %s", name)
+	}
+	if _, exists := r.unitByType[t]; !exists {
+		r.unitByType[t] = make(unitList, 0, 1)
+	}
+	u := &unit{name: name, ObjectProvider: provider}
+	r.unitByName[name] = u
+	r.unitByType[t] = append(r.unitByType[t], u)
 	return nil
 }
 
-func (r *Injector) register(name string, provider Provider) (*Unit, error) {
-	t := provider.Type()
-	if r.indexByType[t].FindFirstByName(name) != nil {
-		return nil, fmt.Errorf("injector: allready registered by name: %s", name)
-	}
-	if _, exists := r.indexByType[t]; !exists {
-		r.indexByType[t] = make(UnitList, 0, 1)
-	}
-	u := &Unit{name: name, Provider: provider}
-	r.indexByType[t] = append(r.indexByType[t], u)
-	return u, nil
-}
-
-func (l UnitList) FindFirstByName(name string) *Unit {
+func (l unitList) FindFirstByName(name string) *unit {
 	for _, u := range l {
 		if u.name == name {
 			return u
@@ -168,8 +191,9 @@ func (l UnitList) FindFirstByName(name string) *Unit {
 }
 
 func New() Injector {
-	return Injector{
-		indexByType: make(map[reflect.Type]UnitList),
-		argsByType:  make(map[reflect.Type]reflect.Value),
+	return &registry{
+		unitByName:    make(map[string]*unit),
+		unitByType:    make(map[reflect.Type]unitList),
+		configsByType: make(map[reflect.Type]*reflect.Value),
 	}
 }
